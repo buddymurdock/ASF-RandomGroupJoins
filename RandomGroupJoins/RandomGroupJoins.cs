@@ -1,8 +1,11 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using ArchiSteamFarm.Core;
@@ -21,6 +24,7 @@ internal sealed class RandomGroupJoins : IASF, IGitHubPluginUpdates {
 	private const byte DefaultMinGroups = 1;
 	private const byte DefaultMaxGroups = 3;
 	private const ushort DefaultDelayBetweenJoinsInSeconds = 300;
+	private const string BundledGroupsFileName = "groups.json";
 
 	// Random per-bot target count of (our pool's) groups to be a member of, picked once and reused for the lifetime of the process
 	private readonly ConcurrentDictionary<string, int> BotGroupTargets = new(StringComparer.Ordinal);
@@ -33,13 +37,16 @@ internal sealed class RandomGroupJoins : IASF, IGitHubPluginUpdates {
 	private ulong[] GroupIDs = [];
 	private byte MaxGroups = DefaultMaxGroups;
 	private byte MinGroups = DefaultMinGroups;
+	private bool UseBundledGroups;
 
 	public string Name => nameof(RandomGroupJoins);
 	public string RepositoryName => "buddymurdock/ASF-RandomGroupJoins";
 	public Version Version => typeof(RandomGroupJoins).Assembly.GetName().Version ?? throw new InvalidOperationException(nameof(Version));
 
-	// Reads RandomGroupJoinsEnabled / RandomGroupJoinsMinGroups / RandomGroupJoinsMaxGroups / RandomGroupJoinsDelayBetweenJoins / RandomGroupJoinsGroupIDs from the global ASF.json config
+	// Reads RandomGroupJoinsEnabled / RandomGroupJoinsMinGroups / RandomGroupJoinsMaxGroups / RandomGroupJoinsDelayBetweenJoins / RandomGroupJoinsGroupIDs / RandomGroupJoinsUseBundledGroups from the global ASF.json config
 	public Task OnASFInit(IReadOnlyDictionary<string, JsonElement>? additionalConfigProperties = null) {
+		HashSet<ulong> parsedGroupIDs = [];
+
 		if (additionalConfigProperties != null) {
 			foreach ((string configProperty, JsonElement configValue) in additionalConfigProperties) {
 				switch (configProperty) {
@@ -59,29 +66,23 @@ internal sealed class RandomGroupJoins : IASF, IGitHubPluginUpdates {
 						DelayBetweenJoinsInSeconds = delayBetweenJoins;
 
 						break;
+					case $"{nameof(RandomGroupJoins)}UseBundledGroups" when configValue.ValueKind is JsonValueKind.True or JsonValueKind.False:
+						UseBundledGroups = configValue.GetBoolean();
+
+						break;
 					case $"{nameof(RandomGroupJoins)}GroupIDs" when configValue.ValueKind == JsonValueKind.Array:
-						HashSet<ulong> parsedGroupIDs = [];
-
-						foreach (JsonElement groupElement in configValue.EnumerateArray()) {
-							ulong? groupID = groupElement.ValueKind switch {
-								JsonValueKind.Number when groupElement.TryGetUInt64(out ulong numericID) => numericID,
-								JsonValueKind.String when ulong.TryParse(groupElement.GetString(), out ulong stringID) => stringID,
-								_ => null
-							};
-
-							if ((groupID is { } validGroupID) && (validGroupID != 0) && new SteamID(validGroupID).IsClanAccount) {
-								parsedGroupIDs.Add(validGroupID);
-							} else {
-								ASF.ArchiLogger.LogGenericWarning($"Ignoring invalid {nameof(RandomGroupJoins)}GroupIDs entry: {groupElement}.");
-							}
-						}
-
-						GroupIDs = [.. parsedGroupIDs];
+						AddParsedGroupIDs(configValue, parsedGroupIDs);
 
 						break;
 				}
 			}
 		}
+
+		if (UseBundledGroups) {
+			LoadBundledGroupIDs(parsedGroupIDs);
+		}
+
+		GroupIDs = [.. parsedGroupIDs];
 
 		if (MinGroups > MaxGroups) {
 			(MinGroups, MaxGroups) = (MaxGroups, MinGroups);
@@ -198,6 +199,65 @@ internal sealed class RandomGroupJoins : IASF, IGitHubPluginUpdates {
 
 		return min == max ? min : Random.Shared.Next(min, max + 1);
 	}
+
+	private static void AddParsedGroupIDs(JsonElement array, HashSet<ulong> target) {
+		foreach (JsonElement groupElement in array.EnumerateArray()) {
+			ulong? groupID = groupElement.ValueKind switch {
+				JsonValueKind.Number when groupElement.TryGetUInt64(out ulong numericID) => numericID,
+				JsonValueKind.String when ulong.TryParse(groupElement.GetString(), out ulong stringID) => stringID,
+				_ => null
+			};
+
+			if ((groupID is { } validGroupID) && (validGroupID != 0) && new SteamID(validGroupID).IsClanAccount) {
+				target.Add(validGroupID);
+			} else {
+				ASF.ArchiLogger.LogGenericWarning($"Ignoring invalid {nameof(RandomGroupJoins)}GroupIDs entry: {groupElement}.");
+			}
+		}
+	}
+
+	// Loads groups.json shipped alongside the plugin DLL, adding its entries on top of whatever came from ASF.json
+	private static void LoadBundledGroupIDs(HashSet<ulong> target) {
+		string? pluginDirectory = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+
+		if (string.IsNullOrEmpty(pluginDirectory)) {
+			ASF.ArchiLogger.LogGenericWarning($"Could not determine plugin directory, {nameof(RandomGroupJoins)}UseBundledGroups will have no effect.");
+
+			return;
+		}
+
+		string filePath = Path.Combine(pluginDirectory, BundledGroupsFileName);
+
+		if (!File.Exists(filePath)) {
+			ASF.ArchiLogger.LogGenericWarning($"{BundledGroupsFileName} not found next to the plugin, {nameof(RandomGroupJoins)}UseBundledGroups will have no effect.");
+
+			return;
+		}
+
+		List<BundledGroupEntry>? entries;
+
+		try {
+			entries = JsonSerializer.Deserialize<List<BundledGroupEntry>>(File.ReadAllText(filePath));
+		} catch (JsonException e) {
+			ASF.ArchiLogger.LogGenericException(e);
+
+			return;
+		}
+
+		if (entries == null) {
+			return;
+		}
+
+		foreach (BundledGroupEntry entry in entries) {
+			if ((entry.Id != 0) && new SteamID(entry.Id).IsClanAccount) {
+				target.Add(entry.Id);
+			} else {
+				ASF.ArchiLogger.LogGenericWarning($"Ignoring invalid entry in {BundledGroupsFileName}: {entry.Id}.");
+			}
+		}
+	}
+
+	private sealed record BundledGroupEntry([property: JsonPropertyName("id")] ulong Id, [property: JsonPropertyName("name")] string? Name, [property: JsonPropertyName("url")] string? Url);
 }
 #pragma warning restore CA5394 // Randomness here only picks an arbitrary bot/group/order, it's not used for anything security-sensitive
 #pragma warning restore CA1001 // Plugin instances live for the process' lifetime; ASF gives IPlugin implementations no disposal hook to call into
