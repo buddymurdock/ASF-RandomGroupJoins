@@ -23,7 +23,8 @@ namespace RandomGroupJoins;
 internal sealed class RandomGroupJoins : IASF, IGitHubPluginUpdates {
 	private const byte DefaultMinGroups = 1;
 	private const byte DefaultMaxGroups = 3;
-	private const ushort DefaultDelayBetweenJoinsInSeconds = 300;
+	private const ushort DefaultMinDelayBetweenJoinsInSeconds = 180;
+	private const ushort DefaultMaxDelayBetweenJoinsInSeconds = 420;
 	private const string BundledGroupsFileName = "groups.json";
 
 	// Random per-bot target count of (our pool's) groups to be a member of, picked once and reused for the lifetime of the process
@@ -31,11 +32,12 @@ internal sealed class RandomGroupJoins : IASF, IGitHubPluginUpdates {
 
 	private CancellationTokenSource? BackgroundLoopCts;
 	private volatile bool CapacityWarningLogged;
-	private ushort DelayBetweenJoinsInSeconds = DefaultDelayBetweenJoinsInSeconds;
 	private bool Enabled;
 	private volatile bool EmptyPoolWarningLogged;
 	private ulong[] GroupIDs = [];
+	private ushort MaxDelayBetweenJoinsInSeconds = DefaultMaxDelayBetweenJoinsInSeconds;
 	private byte MaxGroups = DefaultMaxGroups;
+	private ushort MinDelayBetweenJoinsInSeconds = DefaultMinDelayBetweenJoinsInSeconds;
 	private byte MinGroups = DefaultMinGroups;
 	private bool UseBundledGroups;
 
@@ -43,7 +45,8 @@ internal sealed class RandomGroupJoins : IASF, IGitHubPluginUpdates {
 	public string RepositoryName => "buddymurdock/ASF-RandomGroupJoins";
 	public Version Version => typeof(RandomGroupJoins).Assembly.GetName().Version ?? throw new InvalidOperationException(nameof(Version));
 
-	// Reads RandomGroupJoinsEnabled / RandomGroupJoinsMinGroups / RandomGroupJoinsMaxGroups / RandomGroupJoinsDelayBetweenJoins / RandomGroupJoinsGroupIDs / RandomGroupJoinsUseBundledGroups from the global ASF.json config
+	// Reads RandomGroupJoinsEnabled / RandomGroupJoinsMinGroups / RandomGroupJoinsMaxGroups / RandomGroupJoinsMinDelayBetweenJoins / RandomGroupJoinsMaxDelayBetweenJoins /
+	// RandomGroupJoinsGroupIDs / RandomGroupJoinsUseBundledGroups from the global ASF.json config
 	public Task OnASFInit(IReadOnlyDictionary<string, JsonElement>? additionalConfigProperties = null) {
 		HashSet<ulong> parsedGroupIDs = [];
 
@@ -62,8 +65,12 @@ internal sealed class RandomGroupJoins : IASF, IGitHubPluginUpdates {
 						MaxGroups = maxGroups;
 
 						break;
-					case $"{nameof(RandomGroupJoins)}DelayBetweenJoins" when (configValue.ValueKind == JsonValueKind.Number) && configValue.TryGetUInt16(out ushort delayBetweenJoins) && (delayBetweenJoins > 0):
-						DelayBetweenJoinsInSeconds = delayBetweenJoins;
+					case $"{nameof(RandomGroupJoins)}MinDelayBetweenJoins" when (configValue.ValueKind == JsonValueKind.Number) && configValue.TryGetUInt16(out ushort minDelayBetweenJoins) && (minDelayBetweenJoins > 0):
+						MinDelayBetweenJoinsInSeconds = minDelayBetweenJoins;
+
+						break;
+					case $"{nameof(RandomGroupJoins)}MaxDelayBetweenJoins" when (configValue.ValueKind == JsonValueKind.Number) && configValue.TryGetUInt16(out ushort maxDelayBetweenJoins) && (maxDelayBetweenJoins > 0):
+						MaxDelayBetweenJoinsInSeconds = maxDelayBetweenJoins;
 
 						break;
 					case $"{nameof(RandomGroupJoins)}UseBundledGroups" when configValue.ValueKind is JsonValueKind.True or JsonValueKind.False:
@@ -88,13 +95,17 @@ internal sealed class RandomGroupJoins : IASF, IGitHubPluginUpdates {
 			(MinGroups, MaxGroups) = (MaxGroups, MinGroups);
 		}
 
+		if (MinDelayBetweenJoinsInSeconds > MaxDelayBetweenJoinsInSeconds) {
+			(MinDelayBetweenJoinsInSeconds, MaxDelayBetweenJoinsInSeconds) = (MaxDelayBetweenJoinsInSeconds, MinDelayBetweenJoinsInSeconds);
+		}
+
 		if (!Enabled) {
 			ASF.ArchiLogger.LogGenericInfo($"{Name} is disabled, set {nameof(RandomGroupJoins)}Enabled to true in ASF.json to turn it on.");
 
 			return Task.CompletedTask;
 		}
 
-		ASF.ArchiLogger.LogGenericInfo($"{Name} is enabled, will keep every bot's membership in the configured {GroupIDs.Length} group(s) between {MinGroups} and {MaxGroups}, with {DelayBetweenJoinsInSeconds}s between joins.");
+		ASF.ArchiLogger.LogGenericInfo($"{Name} is enabled, will keep every bot's membership in the configured {GroupIDs.Length} group(s) between {MinGroups} and {MaxGroups}, with {MinDelayBetweenJoinsInSeconds}-{MaxDelayBetweenJoinsInSeconds}s between joins.");
 
 		if (BackgroundLoopCts != null) {
 			// OnASFInit() should only ever be called once per process, this is just a safety net against a possible double start
@@ -114,19 +125,15 @@ internal sealed class RandomGroupJoins : IASF, IGitHubPluginUpdates {
 		return Task.CompletedTask;
 	}
 
+	// Delay is re-rolled every tick within [MinDelayBetweenJoinsInSeconds; MaxDelayBetweenJoinsInSeconds] instead of using a fixed-period PeriodicTimer -
+	// a perfectly metronomic tick interval running around the clock is itself a machine-detectable pattern, independent of anything visible to other users
 	private async Task BackgroundLoopAsync(CancellationToken cancellationToken) {
-		using PeriodicTimer timer = new(TimeSpan.FromSeconds(DelayBetweenJoinsInSeconds));
-
 		while (!cancellationToken.IsCancellationRequested) {
-			bool shouldContinue;
+			int delaySeconds = MinDelayBetweenJoinsInSeconds == MaxDelayBetweenJoinsInSeconds ? MinDelayBetweenJoinsInSeconds : Random.Shared.Next(MinDelayBetweenJoinsInSeconds, MaxDelayBetweenJoinsInSeconds + 1);
 
 			try {
-				shouldContinue = await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false);
+				await Task.Delay(TimeSpan.FromSeconds(delaySeconds), cancellationToken).ConfigureAwait(false);
 			} catch (OperationCanceledException) {
-				break;
-			}
-
-			if (!shouldContinue) {
 				break;
 			}
 
