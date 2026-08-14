@@ -129,10 +129,10 @@ internal sealed class RandomGroupJoins : IASF, IGitHubPluginUpdates {
 	// a perfectly metronomic tick interval running around the clock is itself a machine-detectable pattern, independent of anything visible to other users
 	private async Task BackgroundLoopAsync(CancellationToken cancellationToken) {
 		while (!cancellationToken.IsCancellationRequested) {
-			int delaySeconds = MinDelayBetweenJoinsInSeconds == MaxDelayBetweenJoinsInSeconds ? MinDelayBetweenJoinsInSeconds : Random.Shared.Next(MinDelayBetweenJoinsInSeconds, MaxDelayBetweenJoinsInSeconds + 1);
+			TimeSpan delay = GetRandomDelay(MinDelayBetweenJoinsInSeconds, MaxDelayBetweenJoinsInSeconds);
 
 			try {
-				await Task.Delay(TimeSpan.FromSeconds(delaySeconds), cancellationToken).ConfigureAwait(false);
+				await LongDelayAsync(delay, cancellationToken).ConfigureAwait(false);
 			} catch (OperationCanceledException) {
 				break;
 			}
@@ -143,6 +143,53 @@ internal sealed class RandomGroupJoins : IASF, IGitHubPluginUpdates {
 				ASF.ArchiLogger.LogGenericException(e);
 			}
 		}
+	}
+
+	// Task.Delay's underlying timer caps out at ~49.7 days (uint.MaxValue-1 ms) - a delay past that
+	// throws ArgumentOutOfRangeException synchronously, which would go unhandled here and crash the
+	// entire ASF process via OnUnobservedTaskException (this exact bug hit RandomNickname/RandomProfileAvatar/
+	// RandomProfileBackground in production). Chunking sidesteps the limit for arbitrarily long delays -
+	// needed here now that GetRandomDelay below no longer guarantees an upper bound the way uniform did.
+	private static async Task LongDelayAsync(TimeSpan delay, CancellationToken cancellationToken) {
+		TimeSpan chunk = TimeSpan.FromDays(1);
+
+		while (delay > chunk) {
+			await Task.Delay(chunk, cancellationToken).ConfigureAwait(false);
+			delay -= chunk;
+		}
+
+		if (delay > TimeSpan.Zero) {
+			await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+		}
+	}
+
+	// Real people don't wait a uniformly random amount of time between actions - intervals tend
+	// to cluster around a typical gap with occasional much shorter/longer ones (bursty/heavy-tailed),
+	// not spread flat across [min, max]. Log-normal captures that: min/max become the ~5th/95th
+	// percentiles rather than hard bounds, with sqrt(min*max) as the median.
+	// z is clamped before use because extreme (min, max) ratios produce a large sigma - an un-clamped
+	// Box-Muller tail can drive Math.Exp()/TimeSpan construction into Infinity/OverflowException, the
+	// same failure class LongDelayAsync above was written to fix. The final Math.Clamp is a second,
+	// independent safety net on the result itself, keeping delays (and LongDelayAsync's chunking loop)
+	// bounded to something sane even for pathological configs.
+	private static TimeSpan GetRandomDelay(ushort minSeconds, ushort maxSeconds) {
+		if (minSeconds == maxSeconds) {
+			return TimeSpan.FromSeconds(minSeconds);
+		}
+
+		double median = Math.Sqrt((double) minSeconds * maxSeconds);
+		double sigma = Math.Log((double) maxSeconds / minSeconds) / (2 * 1.645);
+
+		double u1 = 1.0 - Random.Shared.NextDouble();
+		double u2 = Random.Shared.NextDouble();
+		double z = Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Cos(2.0 * Math.PI * u2);
+
+		z = Math.Clamp(z, -3.5, 3.5);
+
+		double seconds = median * Math.Exp(sigma * z);
+		seconds = Math.Clamp(seconds, minSeconds / 10.0, maxSeconds * 5.0);
+
+		return TimeSpan.FromSeconds(seconds);
 	}
 
 	// Sends at most one group-join per call, from a random bot that hasn't reached its target yet, into a random group from the pool it's not already related to
